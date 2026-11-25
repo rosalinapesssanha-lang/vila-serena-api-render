@@ -3,8 +3,14 @@ const http = require("http");
 const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// O modelo pode ser alterado no Render sem precisar editar o código.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+const MAX_BODY_BYTES = 1_000_000;
+const MAX_HISTORY = 12;
+const REQUEST_TIMEOUT_MS = 45_000;
+const MAX_RETRIES = 3;
 
 function send(res, status, data) {
   res.writeHead(status, {
@@ -21,8 +27,8 @@ function readBody(req) {
     let raw = "";
     req.on("data", chunk => {
       raw += chunk;
-      if (raw.length > 1_000_000) {
-        reject(new Error("Corpo da requisição muito grande"));
+      if (Buffer.byteLength(raw, "utf8") > MAX_BODY_BYTES) {
+        reject(new Error("Corpo da requisição muito grande."));
         req.destroy();
       }
     });
@@ -30,7 +36,7 @@ function readBody(req) {
       try {
         resolve(JSON.parse(raw || "{}"));
       } catch {
-        reject(new Error("JSON inválido"));
+        reject(new Error("JSON inválido."));
       }
     });
     req.on("error", reject);
@@ -38,9 +44,9 @@ function readBody(req) {
 }
 
 function normalizeRole(role) {
-  const r = String(role || "").toLowerCase().trim();
-  if (r === "system" || r === "developer") return "system";
-  if (r === "assistant" || r === "model" || r === "npc") return "assistant";
+  const value = String(role || "").toLowerCase().trim();
+  if (value === "system" || value === "developer") return "system";
+  if (value === "assistant" || value === "model" || value === "npc") return "assistant";
   return "user";
 }
 
@@ -49,10 +55,8 @@ function extractChatPayload(body) {
   let message = String(body.message || body.prompt || "").trim();
   const rawHistory = Array.isArray(body.history) ? body.history : [];
   const rawMessages = Array.isArray(body.messages) ? body.messages : [];
-
   const history = [];
 
-  // 1) Processa histórico explícito (formato novo)
   for (const item of rawHistory) {
     if (!item || typeof item !== "object") continue;
     const content = String(item.content ?? item.text ?? "").trim();
@@ -60,69 +64,110 @@ function extractChatPayload(body) {
     const role = normalizeRole(item.role);
     if (role === "system") {
       if (!system) system = content;
-      continue;
+    } else {
+      history.push({ role, content });
     }
-    history.push({ role, content });
   }
 
-  // 2) Compatibilidade com formato antigo que envia tudo em `messages`
-  if (rawMessages.length > 0) {
-    const nonSystem = [];
-    for (const m of rawMessages) {
-      if (!m || typeof m !== "object") continue;
-      const content = String(m.content ?? m.text ?? "").trim();
+  if (rawMessages.length) {
+    const parsed = [];
+    for (const item of rawMessages) {
+      if (!item || typeof item !== "object") continue;
+      const content = String(item.content ?? item.text ?? "").trim();
       if (!content) continue;
-      const role = normalizeRole(m.role);
+      const role = normalizeRole(item.role);
       if (role === "system") {
         if (!system) system = content;
       } else {
-        nonSystem.push({ role, content });
+        parsed.push({ role, content });
       }
     }
 
-    if (!message && nonSystem.length > 0 && nonSystem[nonSystem.length - 1].role === "user") {
-      message = nonSystem.pop().content;
+    if (!message && parsed.length && parsed[parsed.length - 1].role === "user") {
+      message = parsed.pop().content;
     }
-
-    if (history.length === 0 && nonSystem.length > 0) {
-      history.push(...nonSystem);
-    }
+    if (!history.length && parsed.length) history.push(...parsed);
   }
 
-  // Evita duplicar a mensagem atual no final do histórico
-  while (history.length > 0) {
-    const last = history[history.length - 1];
-    if (last.role === "user" && last.content === message) {
-      history.pop();
-    } else {
-      break;
-    }
+  while (history.length && history[history.length - 1].role === "user" &&
+         history[history.length - 1].content === message) {
+    history.pop();
   }
 
   return {
-    system: system || "Você é um morador de Vila Serena.",
+    system: system || "Você é um morador de Vila Serena. Responda de forma natural e coerente com o contexto da cidade.",
     message,
-    history: history.slice(-12)
+    history: history.slice(-MAX_HISTORY)
   };
 }
 
-async function callGemini(system, history, message) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY não configurada no Render");
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRetryable(status) {
+  return status === 408 || status === 429 || status === 500 ||
+    status === 502 || status === 503 || status === 504;
+}
+
+async function fetchWithRetry(url, options, provider) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+      });
+
+      const raw = await response.text();
+      let data;
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        data = { error: { message: raw || "Resposta inválida do provedor." } };
+      }
+
+      if (response.ok) return data;
+
+      const message = data.error?.message || `${provider} respondeu HTTP ${response.status}`;
+      const error = new Error(message);
+      error.status = response.status;
+      error.retryAfter = response.headers.get("retry-after");
+      if (!isRetryable(response.status) || attempt === MAX_RETRIES) throw error;
+      lastError = error;
+
+      const retrySeconds = Number(error.retryAfter);
+      const waitMs = Number.isFinite(retrySeconds) && retrySeconds > 0
+        ? Math.min(retrySeconds * 1000, 12_000)
+        : attempt * 1500;
+      await sleep(waitMs);
+    } catch (error) {
+      lastError = error;
+      const retryableNetworkError = !error.status &&
+        (error.name === "TimeoutError" || error.name === "AbortError" ||
+         error.name === "TypeError" || /fetch failed|network|timeout/i.test(error.message || ""));
+      if (error.status && !isRetryable(error.status)) throw error;
+      if (!retryableNetworkError && !error.status) throw error;
+      if (attempt === MAX_RETRIES) throw error;
+      await sleep(attempt * 1500);
+    }
   }
 
+  throw lastError || new Error(`Falha ao chamar ${provider}.`);
+}
+
+async function callGemini(system, history, message) {
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY não configurada no Render.");
+
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-
-  const contents = history.map(h => ({
-    role: h.role === "assistant" ? "model" : "user",
-    parts: [{ text: h.content }]
+  const contents = history.map(item => ({
+    role: item.role === "assistant" ? "model" : "user",
+    parts: [{ text: item.content }]
   }));
-  contents.push({
-    role: "user",
-    parts: [{ text: message }]
-  });
+  contents.push({ role: "user", parts: [{ text: message }] });
 
-  const response = await fetch(url, {
+  const data = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -130,35 +175,32 @@ async function callGemini(system, history, message) {
       contents,
       generationConfig: { temperature: 0.8, maxOutputTokens: 700 }
     })
-  });
+  }, "Gemini");
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error?.message || `Gemini respondeu HTTP ${response.status}`);
+  const reply = data.candidates?.[0]?.content?.parts
+    ?.map(part => part.text || "").join("").trim();
+  if (!reply) {
+    const reason = data.promptFeedback?.blockReason;
+    throw new Error(reason
+      ? `Gemini bloqueou a solicitação: ${reason}`
+      : "Gemini retornou uma resposta vazia.");
   }
-
-  return (
-    data.candidates?.[0]?.content?.parts
-      ?.map(p => p.text || "")
-      .join("") || "Não consegui formular uma resposta."
-  );
+  return reply;
 }
 
 async function callOpenAI(system, history, message) {
-  if (!OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY não configurada no Render");
-  }
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY não configurada no Render.");
 
   const messages = [
     { role: "system", content: system },
-    ...history.map(h => ({
-      role: h.role === "assistant" ? "assistant" : "user",
-      content: h.content
+    ...history.map(item => ({
+      role: item.role === "assistant" ? "assistant" : "user",
+      content: item.content
     })),
     { role: "user", content: message }
   ];
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+  const data = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -170,18 +212,18 @@ async function callOpenAI(system, history, message) {
       temperature: 0.8,
       max_tokens: 700
     })
-  });
+  }, "OpenAI");
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error?.message || `OpenAI respondeu HTTP ${response.status}`);
+  const reply = data.choices?.[0]?.message?.content;
+  if (typeof reply !== "string" || !reply.trim()) {
+    throw new Error("OpenAI retornou uma resposta vazia.");
   }
-
-  return data.choices?.[0]?.message?.content || "Não consegui formular uma resposta.";
+  return reply.trim();
 }
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") return send(res, 204, {});
+
   const path = new URL(req.url, `http://${req.headers.host || "localhost"}`).pathname;
 
   if (req.method === "GET" && path === "/api/health") {
@@ -191,6 +233,10 @@ const server = http.createServer(async (req, res) => {
       providers: {
         gemini: Boolean(GEMINI_API_KEY),
         openai: Boolean(OPENAI_API_KEY)
+      },
+      models: {
+        gemini: GEMINI_MODEL,
+        openai: OPENAI_MODEL
       }
     });
   }
@@ -201,46 +247,68 @@ const server = http.createServer(async (req, res) => {
       const { system, message, history } = extractChatPayload(body);
       const requested = String(body.provider || body.mode || "auto").toLowerCase().trim();
 
-      if (!message.trim()) {
-        return send(res, 400, { ok: false, error: "Mensagem vazia." });
-      }
+      if (!message) return send(res, 400, { ok: false, error: "Mensagem vazia." });
 
-      let provider = requested;
+      let provider = requested === "google" ? "gemini" : requested;
       if (provider === "auto") {
-        provider = GEMINI_API_KEY ? "gemini" : (OPENAI_API_KEY ? "openai" : "");
+        // No automático, tenta Gemini primeiro e OpenAI como alternativa.
+        if (GEMINI_API_KEY) provider = "gemini";
+        else if (OPENAI_API_KEY) provider = "openai";
+        else provider = "";
       }
-      if (provider === "google") provider = "gemini";
 
       if (provider === "local" || provider === "ollama") {
         return send(res, 400, {
           ok: false,
-          error: "O modo local/Ollama não é executado nesta hospedagem. Use o motor local do próprio jogo ou um servidor Ollama separado."
+          error: "O modo local/Ollama não é executado nesta hospedagem. Use o motor local do jogo ou um servidor Ollama separado."
         });
       }
 
-      let reply;
-      if (provider === "gemini") {
-        reply = await callGemini(system, history, message);
-      } else if (provider === "openai") {
-        reply = await callOpenAI(system, history, message);
-      } else {
+      if (provider !== "gemini" && provider !== "openai") {
         return send(res, 503, {
           ok: false,
-          error: "Nenhum provedor configurado. Adicione GEMINI_API_KEY ou OPENAI_API_KEY nas variáveis do Render."
+          error: "Nenhum provedor válido configurado. Adicione GEMINI_API_KEY ou OPENAI_API_KEY nas variáveis do Render."
         });
       }
 
-      return send(res, 200, {
-        ok: true,
-        reply,
-        response: reply,
-        text: reply,
-        provider
-      });
-    } catch (err) {
-      return send(res, 500, {
+      try {
+        const reply = provider === "gemini"
+          ? await callGemini(system, history, message)
+          : await callOpenAI(system, history, message);
+
+        return send(res, 200, {
+          ok: true, reply, response: reply, text: reply, provider,
+          fallback: false
+        });
+      } catch (primaryError) {
+        // Só troca de provedor no modo automático; modo manual respeita a escolha.
+        if (requested !== "auto") throw primaryError;
+
+        const alternate = provider === "gemini" ? "openai" : "gemini";
+        const alternateAvailable = alternate === "gemini"
+          ? Boolean(GEMINI_API_KEY)
+          : Boolean(OPENAI_API_KEY);
+
+        if (!alternateAvailable) throw primaryError;
+
+        const reply = alternate === "gemini"
+          ? await callGemini(system, history, message)
+          : await callOpenAI(system, history, message);
+
+        return send(res, 200, {
+          ok: true, reply, response: reply, text: reply,
+          provider: alternate, fallback: true,
+          note: `${provider} falhou; resposta gerada pelo provedor alternativo.`
+        });
+      }
+    } catch (error) {
+      console.error("[Vila Serena API]", error);
+      const status = error.status && error.status >= 400 && error.status < 600
+        ? error.status
+        : 502;
+      return send(res, status, {
         ok: false,
-        error: err.message || "Erro interno da API."
+        error: error.message || "Erro interno da API."
       });
     }
   }
