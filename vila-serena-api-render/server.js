@@ -3,9 +3,11 @@ const http = require("http");
 const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 // O modelo pode ser alterado no Render sem precisar editar o código.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 const MAX_BODY_BYTES = 1_000_000;
 const MAX_HISTORY = 12;
@@ -188,6 +190,39 @@ async function callGemini(system, history, message) {
   return reply;
 }
 
+async function callGroq(system, history, message) {
+  if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY não configurada no Render.");
+
+  const messages = [
+    { role: "system", content: system },
+    ...history.map(item => ({
+      role: item.role === "assistant" ? "assistant" : "user",
+      content: item.content
+    })),
+    { role: "user", content: message }
+  ];
+
+  const data = await fetchWithRetry("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${GROQ_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages,
+      temperature: 0.8,
+      max_tokens: 700
+    })
+  }, "Groq");
+
+  const reply = data.choices?.[0]?.message?.content;
+  if (typeof reply !== "string" || !reply.trim()) {
+    throw new Error("Groq retornou uma resposta vazia.");
+  }
+  return reply.trim();
+}
+
 async function callOpenAI(system, history, message) {
   if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY não configurada no Render.");
 
@@ -232,10 +267,12 @@ const server = http.createServer(async (req, res) => {
       service: "vila-serena-api",
       providers: {
         gemini: Boolean(GEMINI_API_KEY),
+        groq: Boolean(GROQ_API_KEY),
         openai: Boolean(OPENAI_API_KEY)
       },
       models: {
         gemini: GEMINI_MODEL,
+        groq: GROQ_MODEL,
         openai: OPENAI_MODEL
       }
     });
@@ -250,9 +287,11 @@ const server = http.createServer(async (req, res) => {
       if (!message) return send(res, 400, { ok: false, error: "Mensagem vazia." });
 
       let provider = requested === "google" ? "gemini" : requested;
+      if (provider === "automatic" || provider === "automático") provider = "auto";
       if (provider === "auto") {
-        // No automático, tenta Gemini primeiro e OpenAI como alternativa.
-        if (GEMINI_API_KEY) provider = "gemini";
+        // No automático, prioriza Groq; Gemini e OpenAI ficam como reservas.
+        if (GROQ_API_KEY) provider = "groq";
+        else if (GEMINI_API_KEY) provider = "gemini";
         else if (OPENAI_API_KEY) provider = "openai";
         else provider = "";
       }
@@ -264,17 +303,19 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      if (provider !== "gemini" && provider !== "openai") {
+      if (provider !== "gemini" && provider !== "groq" && provider !== "openai") {
         return send(res, 503, {
           ok: false,
-          error: "Nenhum provedor válido configurado. Adicione GEMINI_API_KEY ou OPENAI_API_KEY nas variáveis do Render."
+          error: "Nenhum provedor válido configurado. Adicione GROQ_API_KEY, GEMINI_API_KEY ou OPENAI_API_KEY nas variáveis do Render."
         });
       }
 
       try {
         const reply = provider === "gemini"
           ? await callGemini(system, history, message)
-          : await callOpenAI(system, history, message);
+          : provider === "groq"
+            ? await callGroq(system, history, message)
+            : await callOpenAI(system, history, message);
 
         return send(res, 200, {
           ok: true, reply, response: reply, text: reply, provider,
@@ -284,16 +325,20 @@ const server = http.createServer(async (req, res) => {
         // Só troca de provedor no modo automático; modo manual respeita a escolha.
         if (requested !== "auto") throw primaryError;
 
-        const alternate = provider === "gemini" ? "openai" : "gemini";
-        const alternateAvailable = alternate === "gemini"
-          ? Boolean(GEMINI_API_KEY)
-          : Boolean(OPENAI_API_KEY);
+        const alternatives = ["groq", "gemini", "openai"].filter(name => name !== provider);
+        const alternate = alternatives.find(name =>
+          name === "groq" ? Boolean(GROQ_API_KEY) :
+          name === "gemini" ? Boolean(GEMINI_API_KEY) : Boolean(OPENAI_API_KEY)
+        );
+        const alternateAvailable = Boolean(alternate);
 
         if (!alternateAvailable) throw primaryError;
 
         const reply = alternate === "gemini"
           ? await callGemini(system, history, message)
-          : await callOpenAI(system, history, message);
+          : alternate === "groq"
+            ? await callGroq(system, history, message)
+            : await callOpenAI(system, history, message);
 
         return send(res, 200, {
           ok: true, reply, response: reply, text: reply,
