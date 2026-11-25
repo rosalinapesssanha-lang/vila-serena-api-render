@@ -1,13 +1,12 @@
 {
   "name": "vila-serena-api",
   "version": "1.0.0",
-  "private": true,
-  "description": "API de IA para Vila Serena",
+  "description": "Servidor backend da Vila Serena para integração com Gemini e OpenAI",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.0.0"
   }
 }
